@@ -9,9 +9,9 @@ import tempfile
 from datetime import date, datetime
 from pathlib import Path
 
-from npay_ledger import (COLUMNS, FMT, KST, UNKNOWN_REFUND_DATE, ConsistencyError, FetchError, build_rows, fetch_card,
-                         fetch_card_rows, fetch_details, fetch_json, fetch_money_cancels, logged_in, make_row, months_between,
-                         same_card, shopping_payments, summarize, write_csv)
+from npay_ledger import (COLUMNS, FMT, KST, UNKNOWN_REFUND_DATE, ConsistencyError, FetchError, build_rows, ensure_login,
+                         fetch_card, fetch_card_rows, fetch_details, fetch_json, fetch_money_cancels, logged_in, make_row,
+                         months_between, same_card, shopping_payments, summarize, write_csv)
 
 def _ms(s):
     return int(datetime.strptime(s, FMT).replace(tzinfo=KST).timestamp() * 1000)
@@ -191,6 +191,26 @@ def selftest():
     assert fetch_details(no_claim, [order_item])["9"]["refund"] == {} and no_claim.responses == []
     with_claim = FakeReq([ok({"productOrders": [{"claim": {"claimType": "RETURN"}}]}), ok({"refundOccurred": True})])
     assert fetch_details(with_claim, [order_item])["9"]["refund"] == {"refundOccurred": True}
+    # 로그인 대기: 만료된 NID_AUT가 남아 있어도 값이 바뀔 때까지 서버를 두드리지 않는다
+    class FakeCtx:
+        def __init__(self, req, values):
+            self.request, self.values = req, list(values)
+
+        def cookies(self):
+            v = self.values.pop(0)
+            return [{"name": "NID_AUT", "value": v}] if v else []
+
+    class FakePage:
+        def __init__(self, ctx):
+            self.context, self.waits = ctx, 0
+
+        def wait_for_timeout(self, ms):
+            self.waits += 1
+
+    login_req = FakeReq([FakeResp(401, '{"code":"AUTH_40"}'), FakeResp(200, "{}"), FakeResp(400, '{"code":"99"}')])
+    pg = FakePage(FakeCtx(login_req, ["old", "old", None, "new"]))
+    ensure_login(pg)
+    assert login_req.responses == [] and pg.waits == 2, pg.waits
     assert fetch_card(FakeReq([FakeResp(200, "<html>", url="https://card.pay.naver.com/prepaid/intro")])) is None
     page_html = '<script id="__NEXT_DATA__" type="application/json">' + json.dumps(
         {"props": {"pageProps": {"dehydratedState": {"queries": [

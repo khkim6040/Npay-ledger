@@ -410,12 +410,19 @@ def logged_in(req):
 
 
 def ensure_login(page):
-    """두 도메인이 모두 열릴 때까지 3초마다 확인하며, 창에서 로그인하라고 안내한다."""
+    """로그인이 안 돼 있으면 창에서 로그인하라고 안내하고, 서버를 두드리는 대신 NID_AUT 쿠키가 새로 생길 때까지 로컬에서 기다린다."""
     req = page.context.request
     if logged_in(req):
         return
     print("브라우저 창에서 네이버에 로그인해 주세요. 로그인되면 자동으로 이어집니다.")
-    while not logged_in(req):
+
+    def nid_aut():
+        return next((c["value"] for c in page.context.cookies() if c["name"] == "NID_AUT"), None)
+
+    stale = nid_aut()  # 만료된 세션의 쿠키가 남아 있을 수 있으니 값이 바뀌는 것을 기다린다
+    while nid_aut() in (None, stale):
+        page.wait_for_timeout(3000)
+    while not logged_in(req):  # 로그인 직후 orders 도메인이 잠시 403을 주기도 한다
         page.wait_for_timeout(3000)
 
 
