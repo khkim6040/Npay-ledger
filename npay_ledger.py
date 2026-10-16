@@ -128,6 +128,107 @@ def shopping_payments(items, details, card_last4):
     return pays
 
 
+# ---------- 변환: 행 생성과 요약 ----------
+
+class ConsistencyError(Exception):
+    """받은 데이터끼리 맞지 않는다. 실행을 중단한다."""
+
+
+def build_rows(pays, card_rows, money_cancels, since=None):
+    """결제 레코드와 머니카드 행을 합쳐 CSV 행을 만든다. (rows, stats) 반환."""
+    stats = {"matched": 0, "unmatched": 0, "unknown_refund_date": 0, "dropped_refunds": 0}
+    originals = [r for r in card_rows["local"] + card_rows["overseas"] if r.get("cancelYn") != "y"]
+    cancels = [r for r in card_rows["local"] + card_rows["overseas"] if r.get("cancelYn") == "y"]
+    if any(p["money_card"] for p in pays) and not originals and not card_rows["traffic"]:
+        # 머니카드 API는 잘못된 cardId에도 C9(없음)를 돌려주므로 여기서 걸러야 지출이 조용히 빠지지 않는다
+        raise ConsistencyError("결제내역에 머니카드 결제가 있는데 머니카드 내역이 0건입니다. 카드 조회가 잘못됐을 수 있어 중단합니다.")
+
+    # 1. 결제내역의 머니카드 결제 ↔ 머니카드 원거래 행 짝 맞추기 (같은 금액, 승인시각이 결제시각 −5분~+1분)
+    matched = {}  # 머니카드 tid → 결제 레코드
+    for p in pays:
+        if not p["money_card"]:
+            continue
+        cands = [r for r in originals if r["tid"] not in matched and r["wonAmount"] == p["card"]
+                 and p["dt"] - MATCH_BEFORE <= from_iso(r["approvalDateTime"]) <= p["dt"] + MATCH_AFTER]
+        if cands:
+            best = min(cands, key=lambda r: abs(from_iso(r["approvalDateTime"]) - p["dt"]))
+            matched[best["tid"]] = p
+            stats["matched"] += 1
+        else:
+            stats["unmatched"] += 1
+    # 2. 짝이 된 결제의 환불일은 연결된 취소 행의 승인시각 (여러 번이면 마지막)
+    for c in cancels:
+        p = matched.get(c.get("originTid"))
+        if p:
+            dt = from_iso(c["approvalDateTime"])
+            p["refund_dt"] = max(p["refund_dt"], dt) if p["refund_dt"] else dt
+
+    rows = []
+    # 3. 쇼핑 결제 행과 환불 행
+    for p in pays:
+        rows.append(make_row(p["dt"], "결제", p["gross"], p["merchant"], p["product"],
+                             p["card"], p["bank"], p["money"], p["point"],
+                             source="쇼핑", typ=p["typ"], status=p["status"], tid=p["id"], url=p["url"]))
+        if p["refund"] > 0:
+            dt, status = p["refund_dt"] or money_cancels.get(p["id"]), p["status"]
+            if dt is None:
+                dt, status = p["dt"], UNKNOWN_REFUND_DATE
+                stats["unknown_refund_date"] += 1
+            rows.append(make_row(dt, "환불", -p["refund"], p["merchant"], p["product"],
+                                 -p["refund_card"], -p["refund_bank"], -p["refund_money"], -p["refund_point"],
+                                 source="쇼핑", typ=p["typ"], status=status, tid=p["id"],
+                                 origin_id=p["id"], origin_dt=p["dt"], url=p["url"]))
+    # 4. 짝이 없는 머니카드 행 (카드로만 쓴 지출)과 그 취소 행
+    for r in originals:
+        if r["tid"] not in matched:
+            rows.append(make_row(from_iso(r["approvalDateTime"]), "결제", r["wonAmount"], r.get("merchantName") or "", "",
+                                 money=r.get("moneyAmount") or 0, point=r.get("pointAmount") or 0,
+                                 source="머니카드", typ=r["_filter"], tid=r["tid"], mcc=r.get("merchantCategoryCode") or ""))
+    for c in cancels:
+        if c.get("originTid") not in matched:
+            origin_dt = from_iso(c["originalTradeDateTime"]) if c.get("originalTradeDateTime") else None
+            rows.append(make_row(from_iso(c["approvalDateTime"]), "환불", -abs(c["wonAmount"]), c.get("merchantName") or "", "",
+                                 money=-abs(c.get("moneyAmount") or 0), point=-abs(c.get("pointAmount") or 0),
+                                 source="머니카드", typ=c["_filter"], tid=c["tid"], origin_id=c.get("originTid") or "",
+                                 origin_dt=origin_dt, mcc=c.get("merchantCategoryCode") or ""))
+    # 5. 교통카드 (승차 시각 기준, 0원 행은 버린다)
+    for t in card_rows["traffic"]:
+        if t.get("amount"):
+            product = " ".join(x for x in (t.get("transType"), t.get("stationName"), t.get("rideType")) if x)
+            rows.append(make_row(from_iso(t["useDateTime"]), "결제", t["amount"], "교통카드", product,
+                                 source="교통", typ="traffic", tid=t.get("tid") or ""))
+    # 6. --since
+    if since:
+        cutoff = since.strftime(FMT)
+        kept = []
+        for r in rows:
+            if r["구분"] == "결제" and r["일시"] < cutoff:
+                continue
+            if r["구분"] == "환불" and (r["원거래일시"] or r["일시"]) < cutoff:
+                stats["dropped_refunds"] += 1
+                continue
+            kept.append(r)
+        rows = kept
+    rows.sort(key=lambda r: r["일시"])
+    return rows, stats
+
+
+def summarize(rows):
+    """월별 요약. 환불은 원거래 월에서 뺀다."""
+    months = defaultdict(lambda: {"건수": 0, "결제액": 0, "환불액": 0})
+    for r in rows:
+        if r["구분"] == "결제":
+            m = months[r["일시"][:7]]
+            m["건수"] += 1
+            m["결제액"] += r["금액"]
+        else:
+            months[(r["원거래일시"] or r["일시"])[:7]]["환불액"] += -r["금액"]
+    out = [{"월": k, **v, "순지출": v["결제액"] - v["환불액"]} for k, v in sorted(months.items())]
+    if sum(r["금액"] for r in rows) != sum(s["순지출"] for s in out):
+        raise ConsistencyError("거래내역 금액 합계와 요약 순지출 합계가 다릅니다")
+    return out
+
+
 # ---------- selftest 표본 ----------
 
 def _ms(s):
@@ -171,6 +272,39 @@ SAMPLE_DETAILS = {
            "refund": {"refundOccurred": True, "totalRefundAmount": 23810,
                       "refundPayView": {"cardRefundAmount": 22781, "chargedPointRefundAmount": 1029}}},
 }
+SAMPLE_CARD_ROWS = {
+    "local": [
+        {"tid": "T1", "originTid": None, "cancelYn": "n", "approvalDateTime": "2026-08-10T23:40:22",
+         "wonAmount": 27400, "moneyAmount": 27400, "pointAmount": 0, "merchantName": "버스타고_APP",
+         "merchantCategoryCode": "4131", "_filter": "local"},
+        {"tid": "T2", "originTid": "T1", "cancelYn": "y", "approvalDateTime": "2026-08-19T03:42:57",
+         "originalTradeDateTime": "2026-08-10T23:40:22", "wonAmount": -23300, "moneyAmount": -23300,
+         "pointAmount": 0, "merchantName": "버스타고_APP", "merchantCategoryCode": "4131", "_filter": "local"},
+        {"tid": "T3", "originTid": None, "cancelYn": "n", "approvalDateTime": "2026-06-22T22:12:40",
+         "wonAmount": 22781, "moneyAmount": 22781, "pointAmount": 0, "merchantName": "투디터",
+         "merchantCategoryCode": "5995", "_filter": "local"},
+        {"tid": "T4", "originTid": "T3", "cancelYn": "y", "approvalDateTime": "2026-06-30T15:59:00",
+         "originalTradeDateTime": "2026-06-22T22:12:40", "wonAmount": -22781, "moneyAmount": -22781,
+         "pointAmount": 0, "merchantName": "투디터", "merchantCategoryCode": "5995", "_filter": "local"},
+        {"tid": "T5", "originTid": None, "cancelYn": "n", "approvalDateTime": "2026-08-24T17:03:45",
+         "wonAmount": 11600, "moneyAmount": 10000, "pointAmount": 1600, "merchantName": "현장발권",
+         "merchantCategoryCode": "4111", "_filter": "local"},
+        {"tid": "T6", "originTid": "T5", "cancelYn": "y", "approvalDateTime": "2026-08-24T17:09:58",
+         "originalTradeDateTime": "2026-08-24T17:03:45", "wonAmount": -11600, "moneyAmount": -10000,
+         "pointAmount": -1600, "merchantName": "현장발권", "merchantCategoryCode": "4111", "_filter": "local"},
+        {"tid": "T7", "originTid": None, "cancelYn": "n", "approvalDateTime": "2026-08-12T12:00:00",
+         "wonAmount": 54900, "moneyAmount": 0, "pointAmount": 54900, "merchantName": "유니클로",
+         "merchantCategoryCode": "5651", "_filter": "local"},
+    ],
+    "overseas": [],
+    "traffic": [
+        {"tid": "R1", "useDateTime": "2026-08-12T08:30:00", "payDateTime": "2026-08-13T09:00:00", "amount": 1500,
+         "transType": "BUS", "stationName": "수내역", "rideType": "GETTING_ON"},
+        {"tid": "R2", "useDateTime": "2026-08-12T08:50:00", "payDateTime": "2026-08-13T09:00:00", "amount": 0,
+         "transType": "SUB", "stationName": "정자역", "rideType": "TRANSFER"},
+    ],
+}
+SAMPLE_MONEY_CANCELS = {"P2": datetime(2026, 2, 28, 14, 31, 20)}
 
 
 def selftest():
@@ -185,6 +319,38 @@ def selftest():
     assert o1["dt"] == datetime(2026, 6, 22, 22, 13)
     assert (c1["gross"], c1["card"], c1["refund"]) == (5500, 0, 0)
     assert make_row(datetime(2026, 1, 1), "결제", 1000, "m", "p", card=300)["기타"] == 700
+    # build_rows: 중복 제거·환불 행·요약
+    rows, stats = build_rows(shopping_payments(SAMPLE_ITEMS, SAMPLE_DETAILS, "2222"), SAMPLE_CARD_ROWS, SAMPLE_MONEY_CANCELS)
+    assert stats == {"matched": 2, "unmatched": 0, "unknown_refund_date": 1, "dropped_refunds": 0}, stats
+    assert len(rows) == 13, len(rows)  # 결제 5(쇼핑)+2(머니카드)+1(교통), 환불 4(쇼핑)+1(머니카드)
+    assert [r["일시"] for r in rows] == sorted(r["일시"] for r in rows)
+    by = {(r["거래ID"], r["구분"]): r for r in rows}
+    assert by[("P1", "환불")]["일시"] == "2026-08-19 03:42:57" and by[("P1", "환불")]["금액"] == -23300
+    assert by[("P1", "환불")]["원거래ID"] == "P1" and by[("P1", "환불")]["원거래일시"] == "2026-08-10 23:40:23"
+    assert by[("O1", "결제")]["금액"] == 23810 and by[("O1", "결제")]["카드"] == 22781
+    assert by[("O1", "환불")]["일시"] == "2026-06-30 15:59:00" and by[("O1", "환불")]["머니"] == -1029
+    assert by[("P2", "환불")]["일시"] == "2026-02-28 14:31:20"
+    assert by[("P3", "환불")]["일시"] == "2026-01-08 14:51:00" and by[("P3", "환불")]["상태"] == UNKNOWN_REFUND_DATE
+    assert ("T1", "결제") not in by and ("T3", "결제") not in by and ("T2", "환불") not in by and ("T4", "환불") not in by
+    assert by[("T6", "환불")]["원거래ID"] == "T5" and by[("T6", "환불")]["원거래일시"] == "2026-08-24 17:03:45"
+    assert by[("T7", "결제")]["포인트"] == 54900 and by[("T7", "결제")]["업종코드"] == "5651"
+    assert by[("R1", "결제")]["소스"] == "교통" and by[("R1", "결제")]["기타"] == 1500 and ("R2", "결제") not in by
+    assert by[("C1", "결제")]["기타"] == 5500 and by[("P2", "결제")]["기타"] == 0
+    summary = {s["월"]: s for s in summarize(rows)}
+    assert summary["2026-08"] == {"월": "2026-08", "건수": 4, "결제액": 95400, "환불액": 34900, "순지출": 60500}, summary["2026-08"]
+    assert summary["2026-06"]["순지출"] == 0 and summary["2026-01"]["순지출"] == 0
+    assert sum(r["금액"] for r in rows) == sum(s["순지출"] for s in summary.values())
+    # --since: 그 달 이전 결제와, 원거래가 그 이전인 환불은 뺀다
+    rows2, stats2 = build_rows(shopping_payments(SAMPLE_ITEMS, SAMPLE_DETAILS, "2222"), SAMPLE_CARD_ROWS, SAMPLE_MONEY_CANCELS,
+                               since=date(2026, 7, 1))
+    assert stats2["dropped_refunds"] == 3 and all(r["일시"] >= "2026-07-01" for r in rows2), stats2
+    assert sum(r["금액"] for r in rows2) == sum(s["순지출"] for s in summarize(rows2))
+    # 머니카드 결제가 있는데 머니카드 행이 0건이면 중단
+    try:
+        build_rows(shopping_payments(SAMPLE_ITEMS, SAMPLE_DETAILS, "2222"), {"local": [], "overseas": [], "traffic": []}, {})
+        assert False, "ConsistencyError expected"
+    except ConsistencyError:
+        pass
 
 
 if __name__ == "__main__":
