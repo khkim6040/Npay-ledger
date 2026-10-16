@@ -1,5 +1,6 @@
 profile/
 out/
 docs/
+.venv/
 __pycache__/
 *.pyc
