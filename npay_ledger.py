@@ -42,9 +42,17 @@ def from_compact(s):
     return datetime.strptime(s, "%Y%m%d%H%M%S")
 
 
-def last4(masked):
-    digits = re.sub(r"\D", "", masked or "")
-    return digits[-4:] if len(digits) >= 4 else None
+def card_mask(s):
+    """'1111-****-****-****' → '1111************' (자리별 비교용)"""
+    return re.sub(r"[^0-9*]", "", s or "")
+
+
+def same_card(a, b):
+    """가려진 카드번호 두 개가 같은 카드인가. 현장결제는 앞 4자리만, 간편결제는 뒤 4자리만 보여 주므로
+    길이가 같고 둘 다 보이는 자리가 4자리 이상 있으며 그 자리가 전부 같으면 같은 카드로 본다."""
+    a, b = card_mask(a), card_mask(b)
+    seen = [(x, y) for x, y in zip(a, b) if x != "*" and y != "*"]
+    return bool(a) and len(a) == len(b) and len(seen) >= 4 and all(x == y for x, y in seen)
 
 
 def make_row(dt, kind, amount, merchant, product, card=0, bank=0, money=0, point=0, other=None,
@@ -69,7 +77,7 @@ def payment_kind(item):
     return "other"
 
 
-def shopping_payments(items, details, card_last4):
+def shopping_payments(items, details, card_no):
     """결제내역 항목 + 상세 → 결제 레코드. 주문은 orderNo 단위로 묶는다."""
     pays, orders = [], {}
     for it in items:
@@ -92,7 +100,7 @@ def shopping_payments(items, details, card_last4):
             rec.update(id=add["payId"], gross=amt["totalAmount"],
                        card=pm.get("easyCard") or 0, bank=pm.get("easyBank") or 0,
                        money=pm.get("chargePoint") or 0, point=pm.get("rewardPoint") or 0,
-                       money_card=bool(card_last4) and last4(ec.get("maskedNumber")) == card_last4,
+                       money_card=same_card(ec.get("maskedNumber"), card_no),
                        refund=ra.get("totalAmount") or 0,
                        refund_card=rpm.get("easyCard") or 0, refund_bank=rpm.get("easyBank") or 0,
                        refund_money=rpm.get("chargePoint") or 0, refund_point=rpm.get("rewardPoint") or 0)
@@ -115,7 +123,7 @@ def shopping_payments(items, details, card_last4):
                        card=general if adm else 0, bank=0 if adm else general,
                        money=pay.get("chargePointPayAmount") or 0, point=pay.get("rewardPointPayAmount") or 0,
                        money_card=bool(adm) and (adm.get("cardCompanyName") == "N페이 머니카드"
-                                                 or (bool(card_last4) and last4(adm.get("maskedCardNo")) == card_last4)),
+                                                 or same_card(adm.get("maskedCardNo"), card_no)),
                        refund=(rf.get("totalRefundAmount") or 0) if rf.get("refundOccurred") else 0,
                        refund_card=rpv.get("cardRefundAmount") or 0, refund_bank=rpv.get("bankRefundAmount") or 0,
                        refund_money=rpv.get("chargedPointRefundAmount") or 0,
@@ -435,7 +443,7 @@ def run(args):
         card_rows = fetch_all_card_rows(req, card, since, today)
         money_cancels = fetch_money_cancels(req, since, today)
         ctx.close()
-    pays = shopping_payments(items, details, last4(card["maskedCardNo"]) if card else None)
+    pays = shopping_payments(items, details, card["maskedCardNo"] if card else None)
     rows, stats = build_rows(pays, card_rows, money_cancels, since)
     summary = summarize(rows)
     months = write_csv(rows, summary, args.out)
@@ -490,7 +498,7 @@ SAMPLE_ITEMS = [
 ]
 SAMPLE_DETAILS = {
     "P1": {"amount": {"totalAmount": 27400, "paymentMethod": {"easyCard": 27400, "rewardPoint": 0, "chargePoint": 0}},
-           "paymentMethod": {"easyCard": {"maskedNumber": "****-****-****-2222", "corpName": "비씨"}},
+           "paymentMethod": {"easyCard": {"maskedNumber": "1111-****-****-****", "corpName": "비씨"}},
            "refundAmount": {"totalAmount": 23300, "paymentMethod": {"easyCard": 23300}}},
     "P2": {"amount": {"totalAmount": 2350000, "paymentMethod": {"easyBank": 352777, "chargePoint": 1997223}},
            "paymentMethod": {},
@@ -541,7 +549,7 @@ SAMPLE_MONEY_CANCELS = {"P2": datetime(2026, 2, 28, 14, 31, 20)}
 
 
 def selftest():
-    pays = shopping_payments(SAMPLE_ITEMS, SAMPLE_DETAILS, "2222")
+    pays = shopping_payments(SAMPLE_ITEMS, SAMPLE_DETAILS, "1111********2222")
     assert [p["id"] for p in pays] == ["P1", "P2", "P3", "O1", "C1"], [p["id"] for p in pays]
     assert [p["money_card"] for p in pays] == [True, False, False, True, False]
     p1, p2, o1, c1 = pays[0], pays[1], pays[3], pays[4]
@@ -552,8 +560,10 @@ def selftest():
     assert o1["dt"] == datetime(2026, 6, 22, 22, 13)
     assert (c1["gross"], c1["card"], c1["refund"]) == (5500, 0, 0)
     assert make_row(datetime(2026, 1, 1), "결제", 1000, "m", "p", card=300)["기타"] == 700
+    assert same_card("1111-****-****-****", "1111********2222") and same_card("****-****-****-2222", "1111********2222")
+    assert not same_card("****-****-****-3333", "1111********2222") and not same_card(None, "1111********2222")
     # build_rows: 중복 제거·환불 행·요약
-    rows, stats = build_rows(shopping_payments(SAMPLE_ITEMS, SAMPLE_DETAILS, "2222"), SAMPLE_CARD_ROWS, SAMPLE_MONEY_CANCELS)
+    rows, stats = build_rows(shopping_payments(SAMPLE_ITEMS, SAMPLE_DETAILS, "1111********2222"), SAMPLE_CARD_ROWS, SAMPLE_MONEY_CANCELS)
     assert stats == {"matched": 2, "unmatched": 0, "unknown_refund_date": 1, "dropped_refunds": 0}, stats
     assert len(rows) == 13, len(rows)  # 결제 5(쇼핑)+2(머니카드)+1(교통), 환불 4(쇼핑)+1(머니카드)
     assert [r["일시"] for r in rows] == sorted(r["일시"] for r in rows)
@@ -574,13 +584,13 @@ def selftest():
     assert summary["2026-06"]["순지출"] == 0 and summary["2026-01"]["순지출"] == 0
     assert sum(r["금액"] for r in rows) == sum(s["순지출"] for s in summary.values())
     # --since: 그 달 이전 결제와, 원거래가 그 이전인 환불은 뺀다
-    rows2, stats2 = build_rows(shopping_payments(SAMPLE_ITEMS, SAMPLE_DETAILS, "2222"), SAMPLE_CARD_ROWS, SAMPLE_MONEY_CANCELS,
+    rows2, stats2 = build_rows(shopping_payments(SAMPLE_ITEMS, SAMPLE_DETAILS, "1111********2222"), SAMPLE_CARD_ROWS, SAMPLE_MONEY_CANCELS,
                                since=date(2026, 7, 1))
     assert stats2["dropped_refunds"] == 3 and all(r["일시"] >= "2026-07-01" for r in rows2), stats2
     assert sum(r["금액"] for r in rows2) == sum(s["순지출"] for s in summarize(rows2))
     # 머니카드 결제가 있는데 머니카드 행이 0건이면 중단
     try:
-        build_rows(shopping_payments(SAMPLE_ITEMS, SAMPLE_DETAILS, "2222"), {"local": [], "overseas": [], "traffic": []}, {})
+        build_rows(shopping_payments(SAMPLE_ITEMS, SAMPLE_DETAILS, "1111********2222"), {"local": [], "overseas": [], "traffic": []}, {})
         assert False, "ConsistencyError expected"
     except ConsistencyError:
         pass
