@@ -404,7 +404,7 @@ def ensure_login(page):
             return
         if r.status not in (401, 403):
             raise FetchError(f"로그인 확인 실패: HTTP {r.status}: {r.text()[:200]}")
-        input("브라우저 창에서 네이버에 로그인한 뒤 Enter를 누르세요: ")
+        input("브라우저 창에서 네이버에 로그인한 뒤 Enter를 누르세요 ('로그인 상태 유지'를 켜면 다음 실행부터 로그인이 필요 없습니다): ")
 
 
 # ---------- 출력과 실행 ----------
