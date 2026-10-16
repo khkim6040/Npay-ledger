@@ -10,8 +10,8 @@ from datetime import date, datetime
 from pathlib import Path
 
 from npay_ledger import (COLUMNS, FMT, KST, UNKNOWN_REFUND_DATE, ConsistencyError, FetchError, build_rows, fetch_card,
-                         fetch_card_rows, fetch_json, fetch_money_cancels, logged_in, make_row, months_between, same_card,
-                         shopping_payments, summarize, write_csv)
+                         fetch_card_rows, fetch_details, fetch_json, fetch_money_cancels, logged_in, make_row, months_between,
+                         same_card, shopping_payments, summarize, write_csv)
 
 def _ms(s):
     return int(datetime.strptime(s, FMT).replace(tzinfo=KST).timestamp() * 1000)
@@ -183,6 +183,14 @@ def selftest():
         assert False, "FetchError expected"
     except FetchError:
         pass
+    # 주문 상세: 클레임 없는 주문은 환불 조회를 건너뛴다
+    order_item = {"_id": "O9", "date": _ms("2026-09-01 10:00:00"), "additionalData": {"orderNo": "9"},
+                  "orderDetailUrl": "https://orders.pay.naver.com/order/status/9"}
+    ok = lambda result: FakeResp(200, json.dumps({"code": "00", "result": result}))
+    no_claim = FakeReq([ok({"productOrders": [{"claim": None}]})])
+    assert fetch_details(no_claim, [order_item])["9"]["refund"] == {} and no_claim.responses == []
+    with_claim = FakeReq([ok({"productOrders": [{"claim": {"claimType": "RETURN"}}]}), ok({"refundOccurred": True})])
+    assert fetch_details(with_claim, [order_item])["9"]["refund"] == {"refundOccurred": True}
     assert fetch_card(FakeReq([FakeResp(200, "<html>", url="https://card.pay.naver.com/prepaid/intro")])) is None
     page_html = '<script id="__NEXT_DATA__" type="application/json">' + json.dumps(
         {"props": {"pageProps": {"dehydratedState": {"queries": [

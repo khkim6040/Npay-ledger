@@ -286,7 +286,7 @@ def fetch_payments(req, since):
 
 
 def fetch_details(req, items):
-    """즉시결제는 payId별, 주문은 orderNo별 상세."""
+    """즉시결제는 payId별, 주문은 orderNo별 상세. 주문 환불 상세는 클레임이 있는 주문만 조회한다."""
     details = {}
     for n, it in enumerate(items, 1):
         kind = payment_kind(it)
@@ -303,8 +303,10 @@ def fetch_details(req, items):
             if not no:
                 raise FetchError(f"주문번호가 없는 주문 항목: {it.get('_id')}")
             if no not in details:
-                details[no] = {"order": orders_api(req, f"{ORDERS}/orderApi/orderSheet/detail/?orderNo={no}"),
-                               "refund": orders_api(req, f"{ORDERS}/orderApi/orderSheet/detail/refund?orderNo={no}")}
+                order = orders_api(req, f"{ORDERS}/orderApi/orderSheet/detail/?orderNo={no}")
+                claimed = any(po.get("claim") for po in order.get("productOrders") or [])
+                details[no] = {"order": order,
+                               "refund": orders_api(req, f"{ORDERS}/orderApi/orderSheet/detail/refund?orderNo={no}") if claimed else {}}
         if n % 50 == 0:
             print(f"상세 {n}/{len(items)}")
     return details
@@ -447,7 +449,7 @@ def run(args):
         page.goto(f"{PAY}/pc/history")
         ensure_login(page)
         req = ctx.request
-        items = fetch_payments(req, since)
+        items = [i for i in fetch_payments(req, since) if not since or from_ms(i["date"]).date() >= since]  # 마지막 페이지의 since 이전 건은 상세 조회하지 않는다
         details = fetch_details(req, items)
         card = fetch_card(req)
         card_rows = fetch_all_card_rows(req, card, since, today)
