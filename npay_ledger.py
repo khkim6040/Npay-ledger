@@ -162,7 +162,7 @@ def build_rows(pays, card_rows, money_cancels, since=None):
             best = min(cands, key=lambda r: abs(from_iso(r["approvalDateTime"]) - p["dt"]))
             matched[best["tid"]] = p
             stats["matched"] += 1
-        else:
+        elif not since or p["dt"].date() >= since:  # since 이전 결제는 머니카드 내역을 안 받았으니 못 찾는 게 정상
             stats["unmatched"] += 1
     # 2. 짝이 된 결제의 환불일은 연결된 취소 행의 승인시각 (여러 번이면 마지막)
     for c in cancels:
@@ -593,10 +593,13 @@ def selftest():
     assert summary["2026-08"] == {"월": "2026-08", "건수": 4, "결제액": 95400, "환불액": 34900, "순지출": 60500}, summary["2026-08"]
     assert summary["2026-06"]["순지출"] == 0 and summary["2026-01"]["순지출"] == 0
     assert sum(r["금액"] for r in rows) == sum(s["순지출"] for s in summary.values())
-    # --since: 그 달 이전 결제와, 원거래가 그 이전인 환불은 뺀다
-    rows2, stats2 = build_rows(shopping_payments(SAMPLE_ITEMS, SAMPLE_DETAILS, "1111********2222"), SAMPLE_CARD_ROWS, SAMPLE_MONEY_CANCELS,
+    # --since: 그 달 이전 결제와, 원거래가 그 이전인 환불은 뺀다. 그 이전 결제는 머니카드 행이 없어도 짝 못 찾음으로 세지 않는다
+    since_cards = {"local": [r for r in SAMPLE_CARD_ROWS["local"] if r["tid"] not in ("T3", "T4")], "overseas": [],
+                   "traffic": SAMPLE_CARD_ROWS["traffic"]}
+    rows2, stats2 = build_rows(shopping_payments(SAMPLE_ITEMS, SAMPLE_DETAILS, "1111********2222"), since_cards, SAMPLE_MONEY_CANCELS,
                                since=date(2026, 7, 1))
-    assert stats2["dropped_refunds"] == 3 and all(r["일시"] >= "2026-07-01" for r in rows2), stats2
+    assert stats2 == {"matched": 1, "unmatched": 0, "unknown_refund_date": 1, "dropped_refunds": 3}, stats2
+    assert all(r["일시"] >= "2026-07-01" for r in rows2)
     assert sum(r["금액"] for r in rows2) == sum(s["순지출"] for s in summarize(rows2))
     # 머니카드 결제가 있는데 머니카드 행이 0건이면 중단
     try:
