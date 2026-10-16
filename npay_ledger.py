@@ -396,15 +396,25 @@ def fetch_money_cancels(req, since, today):
             return out
 
 
+def logged_in(req):
+    """pay와 orders 두 도메인 모두 로그인 상태인가. 로그인 직후 pay만 먼저 열리고 orders는 잠시 403을 주기도 한다."""
+    r = req.get(f"{PAY}/web-api/timeline/v3/payments/pages?page=1")
+    if r.status not in (200, 401, 403):
+        raise FetchError(f"로그인 확인 실패: HTTP {r.status}: {r.text()[:200]}")
+    if r.status != 200:
+        return False
+    # 없는 주문번호 조회: 로그인 상태면 HTTP 400(code 99), 아니면 HTTP 403(code 25)
+    return req.get(f"{ORDERS}/orderApi/orderSheet/detail/refund?orderNo=0").status != 403
+
+
 def ensure_login(page):
-    """결제내역 API가 200을 줄 때까지, 창에서 로그인하라고 안내한다."""
-    while True:
-        r = page.context.request.get(f"{PAY}/web-api/timeline/v3/payments/pages?page=1")
-        if r.status == 200:
-            return
-        if r.status not in (401, 403):
-            raise FetchError(f"로그인 확인 실패: HTTP {r.status}: {r.text()[:200]}")
-        input("브라우저 창에서 네이버에 로그인한 뒤 Enter를 누르세요 ('로그인 상태 유지'를 켜면 다음 실행부터 로그인이 필요 없습니다): ")
+    """두 도메인이 모두 열릴 때까지 3초마다 확인하며, 창에서 로그인하라고 안내한다."""
+    req = page.context.request
+    if logged_in(req):
+        return
+    print("브라우저 창에서 네이버에 로그인해 주세요. 로그인되면 자동으로 이어집니다.")
+    while not logged_in(req):
+        page.wait_for_timeout(3000)
 
 
 # ---------- 출력과 실행 ----------
@@ -620,6 +630,14 @@ def selftest():
             assert False, "FetchError expected"
         except FetchError as e:
             assert needle in str(e), (needle, str(e))
+    assert logged_in(FakeReq([FakeResp(200, "{}"), FakeResp(400, '{"code":"99"}')]))
+    assert not logged_in(FakeReq([FakeResp(401, '{"code":"AUTH_40"}')]))
+    assert not logged_in(FakeReq([FakeResp(200, "{}"), FakeResp(403, '{"code":"25"}')]))
+    try:
+        logged_in(FakeReq([FakeResp(500, "oops")]))
+        assert False, "FetchError expected"
+    except FetchError:
+        pass
     assert fetch_card_rows(FakeReq([FakeResp(200, '{"code":"C9","message":"결제 정보가 없습니다."}')]),
                            "C", "2026-01-01", "2026-01-31", "local") == []
     two_pages = [FakeResp(200, json.dumps({"code": "00", "result": {"isEndPage": False, "response": [{"tid": "A"}]}})),
