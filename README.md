@@ -34,7 +34,8 @@ Chromium 창이 열립니다. 네이버에 로그인되어 있지 않으면 그 
 | `--since YYYY-MM` | 전체 | 이 달부터만 내보낸다 |
 | `--out DIR` | `out` | 출력 디렉터리 |
 | `--profile DIR` | `profile` | 브라우저 프로필 디렉터리 |
-| `--selftest` | | 네트워크 없이 변환 로직만 검사 |
+
+네트워크 없이 변환 로직만 검사하려면 `python test_npay_ledger.py`를 실행합니다.
 
 ## 출력
 
