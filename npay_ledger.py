@@ -451,7 +451,9 @@ def run(args):
     since = datetime.strptime(args.since, "%Y-%m").date() if args.since else None
     today = date.today()
     with sync_playwright() as pw:
-        ctx = pw.chromium.launch_persistent_context(args.profile, headless=False)
+        ctx = pw.chromium.launch_persistent_context(args.profile, headless=False,
+                                                    ignore_default_args=["--enable-automation"],  # navigator.webdriver를 켜지 않는다
+                                                    args=["--disable-blink-features=AutomationControlled"])
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.goto(f"{PAY}/pc/history")
         ensure_login(page)
