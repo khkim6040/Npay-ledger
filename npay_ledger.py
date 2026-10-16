@@ -229,6 +229,176 @@ def summarize(rows):
     return out
 
 
+# ---------- 조회 계층 ----------
+
+class FetchError(Exception):
+    """조회 실패. 빈 데이터로 취급하지 않고 실행을 중단한다."""
+
+
+LOGIN_EXPIRED_CODES = {"AUTH_40", "25"}  # pay·card 도메인은 401 AUTH_40, orders 도메인은 403 code 25
+
+
+def fetch_json(req, url, body=None):
+    """HTTP 200이고 JSON이면 파싱 결과. 그 외는 전부 FetchError."""
+    r = req.get(url) if body is None else req.post(url, data=body, headers={"content-type": "application/json"})
+    text = r.text()
+    try:
+        data = json.loads(text)
+    except ValueError:
+        data = None
+    if r.status == 200 and data is not None:
+        return data
+    code = data.get("code") if isinstance(data, dict) else None
+    if r.status in (401, 403) and code in LOGIN_EXPIRED_CODES:
+        raise FetchError(f"로그인이 풀렸습니다 (HTTP {r.status}). 다시 실행해서 로그인해 주세요.")
+    raise FetchError(f"{url}\n  HTTP {r.status}: {text[:200]}")
+
+
+def orders_api(req, url):
+    data = fetch_json(req, url)
+    if not isinstance(data, dict) or data.get("code") != "00" or "result" not in data:
+        raise FetchError(f"{url}\n  {json.dumps(data, ensure_ascii=False)[:200]}")
+    return data["result"]
+
+
+def fetch_payments(req, since):
+    """결제내역 목록 전체(최신순). since보다 오래된 건만 남은 페이지에서 멈춘다."""
+    items, page = [], 1
+    while True:
+        data = fetch_json(req, f"{PAY}/web-api/timeline/v3/payments/pages?page={page}")
+        if not isinstance(data, dict) or data.get("success") is not True or "items" not in data:
+            raise FetchError(f"결제내역 목록 응답이 예상과 다릅니다: {json.dumps(data, ensure_ascii=False)[:200]}")
+        if not data["items"]:
+            return items
+        items += data["items"]
+        print(f"결제내역 목록 {page}/{data.get('totalPage', '?')}페이지, 누적 {len(items)}건")
+        if since and all(from_ms(i["date"]).date() < since for i in data["items"]):
+            return items
+        page += 1
+
+
+def fetch_details(req, items):
+    """즉시결제는 payId별, 주문은 orderNo별 상세."""
+    details = {}
+    for n, it in enumerate(items, 1):
+        kind = payment_kind(it)
+        add = it.get("additionalData") or {}
+        if kind == "instant":
+            pay_id = add.get("payId")
+            if not pay_id:
+                raise FetchError(f"결제번호가 없는 즉시결제 항목: {it.get('_id')}")
+            if pay_id not in details:
+                ym = from_ms(it["date"]).strftime("%Y-%m")
+                details[pay_id] = orders_api(req, f"{ORDERS}/orderApi/payment/detail/info?paymentId={pay_id}&yearMonthFormatDate={ym}")
+        elif kind == "order":
+            no = add.get("orderNo")
+            if not no:
+                raise FetchError(f"주문번호가 없는 주문 항목: {it.get('_id')}")
+            if no not in details:
+                details[no] = {"order": orders_api(req, f"{ORDERS}/orderApi/orderSheet/detail/?orderNo={no}"),
+                               "refund": orders_api(req, f"{ORDERS}/orderApi/orderSheet/detail/refund?orderNo={no}")}
+        if n % 50 == 0:
+            print(f"상세 {n}/{len(items)}")
+    return details
+
+
+def fetch_card(req):
+    """머니카드 정보 {cardId, maskedCardNo, issuedDate, ...}. 카드가 없으면 None."""
+    r = req.get(f"{CARD}/prepaid/history")
+    if r.status != 200:
+        raise FetchError(f"머니카드 페이지 HTTP {r.status}: {r.text()[:200]}")
+    if "/prepaid/history/" not in r.url:
+        return None  # 카드가 없으면 내역 페이지로 가지 않는다
+    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', r.text(), re.S)
+    if not m:
+        raise FetchError("머니카드 페이지에서 __NEXT_DATA__를 찾지 못했습니다")
+    queries = json.loads(m.group(1))["props"]["pageProps"]["dehydratedState"]["queries"]
+    for q in queries:
+        if (q.get("queryKey") or [])[:2] == ["card", "info"]:
+            data = q["state"]["data"]
+            return data["result"] if data.get("status") == "registered" else None
+    raise FetchError("머니카드 페이지에 카드 정보가 없습니다")
+
+
+def fetch_card_rows(req, card_id, start, end, flt):
+    """기간·필터 하나의 머니카드 내역. C9(결제 정보 없음)는 빈 목록."""
+    rows, page = [], 1
+    while True:
+        data = fetch_json(req, f"{CARD}/prepaid/api/history/list?startDate={start}&endDate={end}&filter={flt}&cardId={card_id}&pageNumber={page}")
+        if isinstance(data, dict) and data.get("code") == "C9":
+            return rows
+        if not isinstance(data, dict) or data.get("code") != "00" or "result" not in data:
+            raise FetchError(f"머니카드 내역 {flt} {start}~{end}: {json.dumps(data, ensure_ascii=False)[:200]}")
+        for r in data["result"]["response"]:
+            r["_filter"] = flt
+            rows.append(r)
+        if data["result"].get("isEndPage", True):
+            return rows
+        page += 1
+
+
+def next_month(d):
+    return (d.replace(day=28) + timedelta(days=4)).replace(day=1)
+
+
+def months_between(start, end):
+    d = start.replace(day=1)
+    while d <= end:
+        yield d
+        d = next_month(d)
+
+
+def fetch_all_card_rows(req, card, since, today):
+    rows = {"local": [], "overseas": [], "traffic": []}
+    if card is None:
+        print("머니카드가 없어 머니카드 내역은 0건으로 처리합니다")
+        return rows
+    issued = date.fromisoformat(card["issuedDate"][:10])
+    start = max(issued, since) if since else issued
+    for month_start in months_between(start, today):
+        end = min(next_month(month_start) - timedelta(days=1), today)
+        for flt in rows:
+            got = fetch_card_rows(req, card["cardId"], month_start.isoformat(), end.isoformat(), flt)
+            rows[flt] += got
+            print(f"머니카드 {month_start:%Y-%m} {flt} {len(got)}건")
+    return rows
+
+
+def fetch_money_cancels(req, since, today):
+    """머니 내역의 취소 행에서 즉시결제 환불 시각을 모은다. {payId: datetime}. 지출 집계에는 쓰지 않는다."""
+    start = today - timedelta(days=360)  # 이 API는 1년 밖 범위를 code 10으로 거부한다
+    if since and since > start:
+        start = since
+    out, page = {}, 0
+    while True:
+        body = {"minPaydttm": start.strftime("%Y%m%d") + "000000", "maxPaydttm": today.strftime("%Y%m%d") + "235959",
+                "pagingSize": 100, "page": page, "sort": "desc", "isRpTrFg": False}
+        data = fetch_json(req, f"{PAY}/paymoney/api/history/paymoneyList", body=body)
+        if not isinstance(data, dict) or data.get("rtncd") != 1000:
+            raise FetchError(f"머니 내역: {json.dumps(data, ensure_ascii=False)[:200]}")
+        resp = data.get("response") or {}
+        for row in resp.get("list") or []:
+            m = re.search(r"/instantPay/detail/(\w+)", row.get("LINKURL") or "")
+            if row.get("TYPE") == "pmcancel" and m:
+                dt = from_compact(row["PAYDTTM"])
+                out[m.group(1)] = max(out.get(m.group(1), dt), dt)
+        page += 1
+        if page >= ((resp.get("pagingInfo") or {}).get("TOTALPAGE") or 0):
+            print(f"머니 내역 취소 {len(out)}건")
+            return out
+
+
+def ensure_login(page):
+    """결제내역 API가 200을 줄 때까지, 창에서 로그인하라고 안내한다."""
+    while True:
+        r = page.context.request.get(f"{PAY}/web-api/timeline/v3/payments/pages?page=1")
+        if r.status == 200:
+            return
+        if r.status not in (401, 403):
+            raise FetchError(f"로그인 확인 실패: HTTP {r.status}: {r.text()[:200]}")
+        input("브라우저 창에서 네이버에 로그인한 뒤 Enter를 누르세요: ")
+
+
 # ---------- selftest 표본 ----------
 
 def _ms(s):
@@ -351,6 +521,61 @@ def selftest():
         assert False, "ConsistencyError expected"
     except ConsistencyError:
         pass
+    # 조회 계층: 성공 / 데이터 없음 / 실패 구분
+    class FakeResp:
+        def __init__(self, status, body, url=""):
+            self.status, self._body, self.url = status, body, url
+
+        def text(self):
+            return self._body
+
+    class FakeReq:
+        def __init__(self, responses):
+            self.responses = list(responses)
+
+        def get(self, url):
+            return self.responses.pop(0)
+
+        def post(self, url, data=None, headers=None):
+            return self.responses.pop(0)
+
+    assert fetch_json(FakeReq([FakeResp(200, '{"a": 1}')]), "u") == {"a": 1}
+    for resp, needle in [(FakeResp(401, '{"code":"AUTH_40"}'), "로그인"), (FakeResp(403, '{"code":"25"}'), "로그인"),
+                         (FakeResp(500, "oops"), "HTTP 500"), (FakeResp(200, "<html>"), "HTTP 200")]:
+        try:
+            fetch_json(FakeReq([resp]), "u")
+            assert False, "FetchError expected"
+        except FetchError as e:
+            assert needle in str(e), (needle, str(e))
+    assert fetch_card_rows(FakeReq([FakeResp(200, '{"code":"C9","message":"결제 정보가 없습니다."}')]),
+                           "C", "2026-01-01", "2026-01-31", "local") == []
+    two_pages = [FakeResp(200, json.dumps({"code": "00", "result": {"isEndPage": False, "response": [{"tid": "A"}]}})),
+                 FakeResp(200, json.dumps({"code": "00", "result": {"isEndPage": True, "response": [{"tid": "B"}]}}))]
+    got = fetch_card_rows(FakeReq(two_pages), "C", "2026-01-01", "2026-01-31", "local")
+    assert [(r["tid"], r["_filter"]) for r in got] == [("A", "local"), ("B", "local")]
+    try:
+        fetch_card_rows(FakeReq([FakeResp(400, '[{"code":"invalid_value"}]')]), "C", "2026-01-01", "2026-01-31", "local")
+        assert False, "FetchError expected"
+    except FetchError:
+        pass
+    assert fetch_card(FakeReq([FakeResp(200, "<html>", url="https://card.pay.naver.com/prepaid/intro")])) is None
+    page_html = '<script id="__NEXT_DATA__" type="application/json">' + json.dumps(
+        {"props": {"pageProps": {"dehydratedState": {"queries": [
+            {"queryKey": ["card", "info", "nf-card-02"],
+             "state": {"data": {"status": "registered", "result": {"cardId": "C", "maskedCardNo": "1111********2222", "issuedDate": "2026-01-24"}}}}]}}}}
+    ) + "</script>"
+    assert fetch_card(FakeReq([FakeResp(200, page_html, url="https://card.pay.naver.com/prepaid/history/nf-card-02")]))["cardId"] == "C"
+    money_pages = [FakeResp(200, json.dumps({"rtncd": 1000, "response": {"pagingInfo": {"TOTALPAGE": 1}, "list": [
+        {"TYPE": "pmcancel", "PAYDTTM": "20260228143120", "LINKURL": "https://orders.pay.naver.com/instantPay/detail/P2?x=1"},
+        {"TYPE": "pmuse", "PAYDTTM": "20260227211603", "LINKURL": "https://orders.pay.naver.com/instantPay/detail/P2"},
+        {"TYPE": "nfccancel", "PAYDTTM": "20260221163250", "LINKURL": "https://new-m.pay.naver.com/prepaid-card/history/detail/local/T9"}]}}))]
+    assert fetch_money_cancels(FakeReq(money_pages), None, date(2026, 10, 16)) == {"P2": datetime(2026, 2, 28, 14, 31, 20)}
+    try:
+        fetch_money_cancels(FakeReq([FakeResp(200, '{"code":"10","message":"실패"}')]), None, date(2026, 10, 16))
+        assert False, "FetchError expected"
+    except FetchError:
+        pass
+    assert list(months_between(date(2026, 1, 24), date(2026, 3, 2))) == [date(2026, 1, 1), date(2026, 2, 1), date(2026, 3, 1)]
 
 
 if __name__ == "__main__":
