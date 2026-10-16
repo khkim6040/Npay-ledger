@@ -399,6 +399,69 @@ def ensure_login(page):
         input("브라우저 창에서 네이버에 로그인한 뒤 Enter를 누르세요: ")
 
 
+# ---------- 출력과 실행 ----------
+
+def write_csv(rows, summary, out_dir):
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    by_month = defaultdict(list)
+    for r in rows:
+        by_month[r["일시"][:7]].append(r)
+    for month, rs in by_month.items():
+        with open(out / f"{month}.csv", "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=COLUMNS)
+            w.writeheader()
+            w.writerows(rs)
+    with open(out / "summary.csv", "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=["월", "건수", "결제액", "환불액", "순지출"])
+        w.writeheader()
+        w.writerows(summary)
+    return sorted(by_month)
+
+
+def run(args):
+    from playwright.sync_api import sync_playwright
+    since = datetime.strptime(args.since, "%Y-%m").date() if args.since else None
+    today = date.today()
+    with sync_playwright() as pw:
+        ctx = pw.chromium.launch_persistent_context(args.profile, headless=False)
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page.goto(f"{PAY}/pc/history")
+        ensure_login(page)
+        req = ctx.request
+        items = fetch_payments(req, since)
+        details = fetch_details(req, items)
+        card = fetch_card(req)
+        card_rows = fetch_all_card_rows(req, card, since, today)
+        money_cancels = fetch_money_cancels(req, since, today)
+        ctx.close()
+    pays = shopping_payments(items, details, last4(card["maskedCardNo"]) if card else None)
+    rows, stats = build_rows(pays, card_rows, money_cancels, since)
+    summary = summarize(rows)
+    months = write_csv(rows, summary, args.out)
+    print(f"완료: {len(rows)}행, 월 파일 {len(months)}개 → {args.out}/")
+    print(f"머니카드 중복 제거 {stats['matched']}건, 짝 못 찾음 {stats['unmatched']}건, "
+          f"환불일 미상 {stats['unknown_refund_date']}건, since 이전 원거래라 뺀 환불 {stats['dropped_refunds']}건")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="네이버페이 지출 내역을 월별 CSV로 내보낸다")
+    ap.add_argument("--since", help="YYYY-MM. 이 달부터만 내보낸다 (기본: 전체)")
+    ap.add_argument("--out", default="out", help="출력 디렉터리 (기본: out)")
+    ap.add_argument("--profile", default="profile", help="브라우저 프로필 디렉터리 (기본: profile)")
+    ap.add_argument("--selftest", action="store_true", help="네트워크 없이 변환 로직만 검사")
+    args = ap.parse_args()
+    if args.selftest:
+        selftest()
+        print("selftest ok")
+        return
+    try:
+        run(args)
+    except (FetchError, ConsistencyError) as e:
+        print(f"중단: {e}\nCSV를 쓰지 않았습니다.", file=sys.stderr)
+        sys.exit(1)
+
+
 # ---------- selftest 표본 ----------
 
 def _ms(s):
@@ -576,8 +639,17 @@ def selftest():
     except FetchError:
         pass
     assert list(months_between(date(2026, 1, 24), date(2026, 3, 2))) == [date(2026, 1, 1), date(2026, 2, 1), date(2026, 3, 1)]
+    # CSV 출력: 월별 파일과 summary.csv, utf-8-sig
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        months = write_csv(rows, summarize(rows), tmp)
+        assert months == ["2026-01", "2026-02", "2026-06", "2026-07", "2026-08"], months
+        with open(Path(tmp) / "2026-08.csv", encoding="utf-8-sig", newline="") as f:
+            read = list(csv.DictReader(f))
+        assert list(read[0].keys()) == COLUMNS and len(read) == 6, (read[0].keys(), len(read))
+        with open(Path(tmp) / "summary.csv", "rb") as f:
+            assert f.read(3) == b"\xef\xbb\xbf"
 
 
 if __name__ == "__main__":
-    selftest()
-    print("selftest ok")
+    main()
