@@ -23,18 +23,19 @@
 - 네이버와 무관한 **비공식 도구**입니다. 네이버페이의 비공개 API를 호출하므로 네이버 이용약관의 자동화 수단 금지 조항에 해당할 수 있고, 계정 이용 제한을 받을 가능성이 있습니다. 이에 따른 책임은 사용자 본인에게 있습니다.
 - **본인 계정에만** 사용하세요. 타인 계정 조회에 쓰지 마세요.
 
-## 설치
-
-Python 3.8 이상.
-
-```
-pip install -r requirements.txt
-playwright install chromium
-```
-
 ## 실행
 
-```
+Python 3.8 이상.
+새 터미널에서 실행할 때는 `source .venv/bin/activate`로 가상환경을 다시 활성화합니다.
+
+```bash
+# 설치
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+playwright install chromium
+
+# 실행
 python npay_ledger.py                 # 전체 기간
 python npay_ledger.py --since 2026-01 # 2026년 1월부터
 ```
